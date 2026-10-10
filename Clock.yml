@@ -1,0 +1,833 @@
+name: Build mod
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+env:
+  FORGE_VERSION: 1.20.1-47.3.0
+  MOD_ID: timestopclock
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Create mod sources
+        run: |
+          mkdir -p "modsrc/src/main/java/com/example/timestopclock"
+          cat > "modsrc/src/main/java/com/example/timestopclock/ModItems.java" <<'MODEOF'
+          package com.example.timestopclock;
+
+          import com.example.timestopclock.item.TimeStopClockItem;
+          import net.minecraft.core.registries.Registries;
+          import net.minecraft.network.chat.Component;
+          import net.minecraft.world.item.CreativeModeTab;
+          import net.minecraft.world.item.Item;
+          import net.minecraft.world.item.ItemStack;
+          import net.minecraft.world.item.Rarity;
+          import net.minecraftforge.registries.DeferredRegister;
+          import net.minecraftforge.registries.ForgeRegistries;
+          import net.minecraftforge.registries.RegistryObject;
+
+          public final class ModItems {
+              public static final DeferredRegister<Item> ITEMS =
+                      DeferredRegister.create(ForgeRegistries.ITEMS, TimeStopClockMod.MOD_ID);
+              public static final DeferredRegister<CreativeModeTab> TABS =
+                      DeferredRegister.create(Registries.CREATIVE_MODE_TAB, TimeStopClockMod.MOD_ID);
+
+              public static final RegistryObject<Item> TIME_STOP_CLOCK = ITEMS.register("time_stop_clock",
+                      () -> new TimeStopClockItem(new Item.Properties().stacksTo(1).rarity(Rarity.EPIC)));
+
+              public static final RegistryObject<CreativeModeTab> MAIN_TAB = TABS.register("main",
+                      () -> CreativeModeTab.builder()
+                              .title(Component.translatable("itemGroup.timestopclock"))
+                              .icon(() -> new ItemStack(TIME_STOP_CLOCK.get()))
+                              .displayItems((params, output) -> output.accept(TIME_STOP_CLOCK.get()))
+                              .build());
+
+              private ModItems() {}
+          }
+          MODEOF
+          mkdir -p "modsrc/src/main/java/com/example/timestopclock"
+          cat > "modsrc/src/main/java/com/example/timestopclock/TimeStopClockMod.java" <<'MODEOF'
+          package com.example.timestopclock;
+
+          import com.example.timestopclock.network.ModNetwork;
+          import net.minecraftforge.eventbus.api.IEventBus;
+          import net.minecraftforge.fml.common.Mod;
+          import net.minecraftforge.fml.event.lifecycle.FMLCommonSetupEvent;
+          import net.minecraftforge.fml.javafmlmod.FMLJavaModLoadingContext;
+
+          @Mod(TimeStopClockMod.MOD_ID)
+          public class TimeStopClockMod {
+              public static final String MOD_ID = "timestopclock";
+
+              public TimeStopClockMod() {
+                  IEventBus modBus = FMLJavaModLoadingContext.get().getModEventBus();
+                  ModItems.ITEMS.register(modBus);
+                  ModItems.TABS.register(modBus);
+                  modBus.addListener(this::commonSetup);
+              }
+
+              private void commonSetup(FMLCommonSetupEvent event) {
+                  event.enqueueWork(ModNetwork::register);
+              }
+          }
+          MODEOF
+          mkdir -p "modsrc/src/main/java/com/example/timestopclock/client"
+          cat > "modsrc/src/main/java/com/example/timestopclock/client/ClientTimeStop.java" <<'MODEOF'
+          package com.example.timestopclock.client;
+
+          import com.example.timestopclock.TimeStopClockMod;
+          import com.example.timestopclock.network.SyncPacket;
+          import com.example.timestopclock.time.TimeStopHold;
+          import com.example.timestopclock.time.TimeStopState;
+          import net.minecraft.client.Minecraft;
+          import net.minecraft.client.multiplayer.ClientLevel;
+          import net.minecraft.client.renderer.GameRenderer;
+          import net.minecraft.network.chat.Component;
+          import net.minecraft.resources.ResourceLocation;
+          import net.minecraft.world.entity.Entity;
+          import net.minecraftforge.api.distmarker.Dist;
+          import net.minecraftforge.event.TickEvent;
+          import net.minecraftforge.eventbus.api.SubscribeEvent;
+          import net.minecraftforge.fml.common.Mod;
+
+          import java.lang.reflect.Method;
+          import java.util.ArrayList;
+          import java.util.List;
+
+          /**
+           * Клиентская часть: эффект "The World" (негатив -> серый мир), титул "ЗА ВАРУДО!"
+           * и удержание сущностей на месте на стороне клиента.
+           */
+          @Mod.EventBusSubscriber(modid = TimeStopClockMod.MOD_ID, value = Dist.CLIENT)
+          public final class ClientTimeStop {
+              private static final ResourceLocation INVERT = new ResourceLocation("shaders/post/invert.json");
+              private static final ResourceLocation DESATURATE = new ResourceLocation("shaders/post/desaturate.json");
+
+              /** Сколько тиков показывать негатив в начале остановки. */
+              private static final int FLASH_TICKS = 12;
+
+              private static int ticks;
+              /** 0 - нет шейдера, 1 - негатив, 2 - серый. */
+              private static int currentShader;
+
+              public static void onSync(SyncPacket msg) {
+                  TimeStopState st = TimeStopState.CLIENT;
+                  boolean was = st.stopped;
+                  st.clear();
+                  st.stopped = msg.stopped();
+                  st.owner = msg.stopped() ? msg.owner() : null;
+                  ticks = 0;
+
+                  Minecraft mc = Minecraft.getInstance();
+                  if (msg.stopped() && !was) {
+                      mc.gui.setTimes(5, 30, 15);
+                      mc.gui.setTitle(Component.translatable("title.timestopclock.za_warudo"));
+                      mc.gui.setSubtitle(Component.translatable("subtitle.timestopclock.stopped"));
+                  }
+                  if (!msg.stopped()) {
+                      setShader(0);
+                  }
+              }
+
+              @SubscribeEvent
+              public static void onClientTick(TickEvent.ClientTickEvent event) {
+                  if (event.phase != TickEvent.Phase.END) return;
+                  Minecraft mc = Minecraft.getInstance();
+                  TimeStopState st = TimeStopState.CLIENT;
+
+                  if (mc.level == null || mc.player == null) {
+                      st.stopped = false;
+                      st.owner = null;
+                      st.clear();
+                      currentShader = 0;
+                      return;
+                  }
+                  if (!st.stopped) {
+                      if (currentShader != 0) setShader(0);
+                      return;
+                  }
+
+                  ticks++;
+                  boolean isOwner = mc.player.getUUID().equals(st.owner);
+                  int wanted = ticks <= FLASH_TICKS ? 1 : (isOwner ? 0 : 2);
+                  if (wanted != currentShader) setShader(wanted);
+
+                  List<Entity> list = new ArrayList<>();
+                  ((ClientLevel) mc.level).entitiesForRendering().forEach(list::add);
+                  TimeStopHold.hold(list, st);
+              }
+
+              private static void setShader(int mode) {
+                  Minecraft mc = Minecraft.getInstance();
+                  GameRenderer renderer = mc.gameRenderer;
+                  currentShader = mode;
+                  if (mode == 0) {
+                      renderer.shutdownEffect();
+                      return;
+                  }
+                  loadEffect(renderer, mode == 1 ? INVERT : DESATURATE);
+              }
+
+              /** loadEffect может быть приватным в зависимости от маппингов, поэтому вызываем через рефлексию. */
+              private static void loadEffect(GameRenderer renderer, ResourceLocation id) {
+                  try {
+                      for (Method m : GameRenderer.class.getDeclaredMethods()) {
+                          Class<?>[] params = m.getParameterTypes();
+                          boolean byName = m.getName().equals("loadEffect") || m.getName().equals("m_109128_");
+                          if (byName && params.length == 1 && params[0] == ResourceLocation.class) {
+                              m.setAccessible(true);
+                              m.invoke(renderer, id);
+                              return;
+                          }
+                      }
+                  } catch (Exception ex) {
+                      // Шейдер - это только украшение, без него мод продолжит работать
+                      System.err.println("[timestopclock] Could not load post effect " + id + ": " + ex);
+                  }
+              }
+
+              private ClientTimeStop() {}
+          }
+          MODEOF
+          mkdir -p "modsrc/src/main/java/com/example/timestopclock/item"
+          cat > "modsrc/src/main/java/com/example/timestopclock/item/TimeStopClockItem.java" <<'MODEOF'
+          package com.example.timestopclock.item;
+
+          import com.example.timestopclock.time.TimeStopManager;
+          import com.example.timestopclock.time.TimeStopState;
+          import net.minecraft.ChatFormatting;
+          import net.minecraft.network.chat.Component;
+          import net.minecraft.server.level.ServerPlayer;
+          import net.minecraft.world.InteractionHand;
+          import net.minecraft.world.InteractionResultHolder;
+          import net.minecraft.world.entity.player.Player;
+          import net.minecraft.world.item.Item;
+          import net.minecraft.world.item.ItemStack;
+          import net.minecraft.world.item.TooltipFlag;
+          import net.minecraft.world.level.Level;
+          import org.jetbrains.annotations.Nullable;
+
+          import java.util.List;
+
+          public class TimeStopClockItem extends Item {
+
+              public TimeStopClockItem(Properties properties) {
+                  super(properties);
+              }
+
+              @Override
+              public InteractionResultHolder<ItemStack> use(Level level, Player player, InteractionHand hand) {
+                  ItemStack stack = player.getItemInHand(hand);
+                  if (!level.isClientSide() && player instanceof ServerPlayer serverPlayer) {
+                      TimeStopManager.toggle(serverPlayer);
+                      player.getCooldowns().addCooldown(this, 20);
+                  }
+                  return InteractionResultHolder.sidedSuccess(stack, level.isClientSide());
+              }
+
+              /** Часы светятся, пока время остановлено. */
+              @Override
+              public boolean isFoil(ItemStack stack) {
+                  return TimeStopState.CLIENT.stopped;
+              }
+
+              @Override
+              public void appendHoverText(ItemStack stack, @Nullable Level level, List<Component> tooltip, TooltipFlag flag) {
+                  tooltip.add(Component.translatable("tooltip.timestopclock.time_stop_clock").withStyle(ChatFormatting.GRAY));
+              }
+          }
+          MODEOF
+          mkdir -p "modsrc/src/main/java/com/example/timestopclock/network"
+          cat > "modsrc/src/main/java/com/example/timestopclock/network/ModNetwork.java" <<'MODEOF'
+          package com.example.timestopclock.network;
+
+          import com.example.timestopclock.TimeStopClockMod;
+          import net.minecraft.resources.ResourceLocation;
+          import net.minecraft.server.level.ServerPlayer;
+          import net.minecraftforge.network.NetworkRegistry;
+          import net.minecraftforge.network.PacketDistributor;
+          import net.minecraftforge.network.simple.SimpleChannel;
+
+          public final class ModNetwork {
+              private static final String PROTOCOL = "1";
+
+              public static final SimpleChannel CHANNEL = NetworkRegistry.newSimpleChannel(
+                      new ResourceLocation(TimeStopClockMod.MOD_ID, "main"),
+                      () -> PROTOCOL, PROTOCOL::equals, PROTOCOL::equals);
+
+              public static void register() {
+                  CHANNEL.registerMessage(0, SyncPacket.class,
+                          SyncPacket::encode, SyncPacket::decode, SyncPacket::handle);
+              }
+
+              public static void sendToAll(SyncPacket packet) {
+                  CHANNEL.send(PacketDistributor.ALL.noArg(), packet);
+              }
+
+              public static void sendTo(ServerPlayer player, SyncPacket packet) {
+                  CHANNEL.send(PacketDistributor.PLAYER.with(() -> player), packet);
+              }
+
+              private ModNetwork() {}
+          }
+          MODEOF
+          mkdir -p "modsrc/src/main/java/com/example/timestopclock/network"
+          cat > "modsrc/src/main/java/com/example/timestopclock/network/SyncPacket.java" <<'MODEOF'
+          package com.example.timestopclock.network;
+
+          import com.example.timestopclock.client.ClientTimeStop;
+          import net.minecraft.network.FriendlyByteBuf;
+          import net.minecraftforge.api.distmarker.Dist;
+          import net.minecraftforge.fml.DistExecutor;
+          import net.minecraftforge.network.NetworkEvent;
+
+          import java.util.UUID;
+          import java.util.function.Supplier;
+
+          public record SyncPacket(boolean stopped, UUID owner) {
+
+              public static void encode(SyncPacket msg, FriendlyByteBuf buf) {
+                  buf.writeBoolean(msg.stopped());
+                  buf.writeUUID(msg.owner() == null ? new UUID(0L, 0L) : msg.owner());
+              }
+
+              public static SyncPacket decode(FriendlyByteBuf buf) {
+                  return new SyncPacket(buf.readBoolean(), buf.readUUID());
+              }
+
+              public static void handle(SyncPacket msg, Supplier<NetworkEvent.Context> ctx) {
+                  ctx.get().enqueueWork(() ->
+                          DistExecutor.unsafeRunWhenOn(Dist.CLIENT, () -> () -> ClientTimeStop.onSync(msg)));
+                  ctx.get().setPacketHandled(true);
+              }
+          }
+          MODEOF
+          mkdir -p "modsrc/src/main/java/com/example/timestopclock/time"
+          cat > "modsrc/src/main/java/com/example/timestopclock/time/TimeStopEvents.java" <<'MODEOF'
+          package com.example.timestopclock.time;
+
+          import com.example.timestopclock.TimeStopClockMod;
+          import com.example.timestopclock.network.ModNetwork;
+          import com.example.timestopclock.network.SyncPacket;
+          import net.minecraft.server.MinecraftServer;
+          import net.minecraft.server.level.ServerLevel;
+          import net.minecraft.server.level.ServerPlayer;
+          import net.minecraft.tags.DamageTypeTags;
+          import net.minecraft.world.damagesource.DamageSource;
+          import net.minecraft.world.entity.Entity;
+          import net.minecraft.world.entity.LivingEntity;
+          import net.minecraft.world.entity.player.Player;
+          import net.minecraft.world.phys.Vec3;
+          import net.minecraftforge.event.TickEvent;
+          import net.minecraftforge.event.entity.ProjectileImpactEvent;
+          import net.minecraftforge.event.entity.living.LivingAttackEvent;
+          import net.minecraftforge.event.entity.living.LivingDeathEvent;
+          import net.minecraftforge.event.entity.living.LivingEvent;
+          import net.minecraftforge.event.entity.player.AttackEntityEvent;
+          import net.minecraftforge.event.entity.player.PlayerEvent;
+          import net.minecraftforge.event.entity.player.PlayerInteractEvent;
+          import net.minecraftforge.event.level.BlockEvent;
+          import net.minecraftforge.event.server.ServerStoppingEvent;
+          import net.minecraftforge.eventbus.api.SubscribeEvent;
+          import net.minecraftforge.fml.LogicalSide;
+          import net.minecraftforge.fml.common.Mod;
+          import net.minecraftforge.server.ServerLifecycleHooks;
+
+          import java.util.ArrayList;
+          import java.util.List;
+
+          @Mod.EventBusSubscriber(modid = TimeStopClockMod.MOD_ID)
+          public final class TimeStopEvents {
+
+              /** Мобы (и любые живые существа, кроме игроков) не тикают, пока время остановлено. */
+              @SubscribeEvent
+              public static void onLivingTick(LivingEvent.LivingTickEvent event) {
+                  LivingEntity entity = event.getEntity();
+                  if (entity instanceof Player) return;
+                  if (TimeStopState.of(entity.level()).isFrozen(entity)) {
+                      event.setCanceled(true);
+                  }
+              }
+
+              /** Удерживаем стрелы, предметы, TNT и прочее на месте (сервер). */
+              @SubscribeEvent
+              public static void onLevelTick(TickEvent.LevelTickEvent event) {
+                  if (event.side != LogicalSide.SERVER || !(event.level instanceof ServerLevel level)) return;
+                  TimeStopState st = TimeStopState.SERVER;
+                  if (!st.stopped) return;
+                  List<Entity> list = new ArrayList<>();
+                  level.getAllEntities().forEach(list::add);
+                  TimeStopHold.hold(list, st);
+              }
+
+              /** Остальные игроки замирают на месте. */
+              @SubscribeEvent
+              public static void onServerTick(TickEvent.ServerTickEvent event) {
+                  if (event.phase != TickEvent.Phase.END) return;
+                  TimeStopState st = TimeStopState.SERVER;
+                  if (!st.stopped) return;
+                  MinecraftServer server = ServerLifecycleHooks.getCurrentServer();
+                  if (server == null) return;
+                  for (ServerPlayer p : server.getPlayerList().getPlayers()) {
+                      if (p.isSpectator() || !st.isFrozen(p)) continue;
+                      Vec3 stored = st.pos.computeIfAbsent(p.getUUID(), k -> p.position());
+                      p.setDeltaMovement(Vec3.ZERO);
+                      if (p.position().distanceToSqr(stored) > 1.0E-4) {
+                          p.connection.teleport(stored.x, stored.y, stored.z, p.getYRot(), p.getXRot());
+                      }
+                  }
+              }
+
+              /** Снаряды в замороженном времени не попадают ни во что. */
+              @SubscribeEvent
+              public static void onProjectileImpact(ProjectileImpactEvent event) {
+                  Entity projectile = event.getProjectile();
+                  if (TimeStopState.of(projectile.level()).isFrozen(projectile)) {
+                      event.setCanceled(true);
+                  }
+              }
+
+              /** Урон по замороженным целям копится и применяется разом при возобновлении времени. */
+              @SubscribeEvent
+              public static void onLivingAttack(LivingAttackEvent event) {
+                  LivingEntity target = event.getEntity();
+                  if (target.level().isClientSide()) return;
+                  TimeStopState st = TimeStopState.SERVER;
+                  if (!st.isFrozen(target)) return;
+
+                  DamageSource source = event.getSource();
+                  if (source.is(DamageTypeTags.BYPASSES_INVULNERABILITY)) return; // /kill, бездна
+
+                  event.setCanceled(true);
+                  Entity attacker = source.getEntity();
+                  if (attacker != null && attacker.getUUID().equals(st.owner)) {
+                      st.pending.computeIfAbsent(target.getUUID(), k -> new TimeStopState.Pending(source)).amount
+                              += event.getAmount();
+                  }
+              }
+
+              // ---- Замороженные игроки ничего не могут делать ----
+
+              @SubscribeEvent
+              public static void onInteract(PlayerInteractEvent event) {
+                  Player p = event.getEntity();
+                  if (event.isCancelable() && TimeStopState.of(p.level()).isFrozen(p)) {
+                      event.setCanceled(true);
+                  }
+              }
+
+              @SubscribeEvent
+              public static void onAttackEntity(AttackEntityEvent event) {
+                  Player p = event.getEntity();
+                  if (TimeStopState.of(p.level()).isFrozen(p)) {
+                      event.setCanceled(true);
+                  }
+              }
+
+              @SubscribeEvent
+              public static void onBlockBreak(BlockEvent.BreakEvent event) {
+                  Player p = event.getPlayer();
+                  if (TimeStopState.SERVER.isFrozen(p)) {
+                      event.setCanceled(true);
+                  }
+              }
+
+              // ---- Жизненный цикл ----
+
+              @SubscribeEvent
+              public static void onLogin(PlayerEvent.PlayerLoggedInEvent event) {
+                  if (event.getEntity() instanceof ServerPlayer sp) {
+                      TimeStopState st = TimeStopState.SERVER;
+                      ModNetwork.sendTo(sp, new SyncPacket(st.stopped, st.owner));
+                  }
+              }
+
+              @SubscribeEvent
+              public static void onLogout(PlayerEvent.PlayerLoggedOutEvent event) {
+                  TimeStopState st = TimeStopState.SERVER;
+                  if (st.stopped && event.getEntity() instanceof ServerPlayer sp && sp.getUUID().equals(st.owner)) {
+                      TimeStopManager.resume(sp.server);
+                  }
+              }
+
+              @SubscribeEvent
+              public static void onDeath(LivingDeathEvent event) {
+                  TimeStopState st = TimeStopState.SERVER;
+                  if (st.stopped && event.getEntity() instanceof ServerPlayer sp && sp.getUUID().equals(st.owner)) {
+                      TimeStopManager.resume(sp.server);
+                  }
+              }
+
+              @SubscribeEvent
+              public static void onServerStopping(ServerStoppingEvent event) {
+                  TimeStopManager.resume(event.getServer());
+              }
+
+              private TimeStopEvents() {}
+          }
+          MODEOF
+          mkdir -p "modsrc/src/main/java/com/example/timestopclock/time"
+          cat > "modsrc/src/main/java/com/example/timestopclock/time/TimeStopHold.java" <<'MODEOF'
+          package com.example.timestopclock.time;
+
+          import net.minecraft.world.entity.Entity;
+          import net.minecraft.world.entity.item.PrimedTnt;
+          import net.minecraft.world.entity.player.Player;
+          import net.minecraft.world.phys.Vec3;
+
+          import java.util.UUID;
+
+          /** Удерживает замороженные сущности на месте (стрелы, предметы, TNT, лодки и т.д.). */
+          public final class TimeStopHold {
+
+              public static void hold(Iterable<Entity> entities, TimeStopState st) {
+                  for (Entity e : entities) {
+                      if (e instanceof Player || e.isRemoved() || e.isPassenger() || !st.isFrozen(e)) continue;
+
+                      UUID id = e.getUUID();
+                      Vec3 p = st.pos.get(id);
+                      if (p == null) {
+                          p = e.position();
+                          st.pos.put(id, p);
+                          st.vel.put(id, e.getDeltaMovement());
+                          if (e instanceof PrimedTnt tnt) st.fuse.put(id, tnt.getFuse());
+                      }
+
+                      e.setDeltaMovement(Vec3.ZERO);
+                      if (e.getX() != p.x || e.getY() != p.y || e.getZ() != p.z) {
+                          e.setPos(p.x, p.y, p.z);
+                      }
+                      if (e instanceof PrimedTnt tnt) {
+                          Integer f = st.fuse.get(id);
+                          if (f != null) tnt.setFuse(f);
+                      }
+                  }
+              }
+
+              private TimeStopHold() {}
+          }
+          MODEOF
+          mkdir -p "modsrc/src/main/java/com/example/timestopclock/time"
+          cat > "modsrc/src/main/java/com/example/timestopclock/time/TimeStopManager.java" <<'MODEOF'
+          package com.example.timestopclock.time;
+
+          import com.example.timestopclock.network.ModNetwork;
+          import com.example.timestopclock.network.SyncPacket;
+          import net.minecraft.network.chat.Component;
+          import net.minecraft.server.MinecraftServer;
+          import net.minecraft.server.level.ServerLevel;
+          import net.minecraft.server.level.ServerPlayer;
+          import net.minecraft.sounds.SoundEvent;
+          import net.minecraft.sounds.SoundEvents;
+          import net.minecraft.sounds.SoundSource;
+          import net.minecraft.world.entity.Entity;
+          import net.minecraft.world.entity.LivingEntity;
+          import net.minecraft.world.entity.player.Player;
+          import net.minecraft.world.level.GameRules;
+          import net.minecraft.world.phys.Vec3;
+
+          import java.util.ArrayList;
+          import java.util.List;
+          import java.util.Map;
+          import java.util.UUID;
+
+          /** Серверная логика: остановка и возобновление времени. */
+          public final class TimeStopManager {
+
+              public static void toggle(ServerPlayer player) {
+                  TimeStopState st = TimeStopState.SERVER;
+                  if (!st.stopped) {
+                      freeze(player);
+                  } else if (player.getUUID().equals(st.owner)) {
+                      resume(player.server);
+                  } else {
+                      player.displayClientMessage(Component.translatable("message.timestopclock.busy"), true);
+                  }
+              }
+
+              public static void freeze(ServerPlayer player) {
+                  MinecraftServer server = player.server;
+                  TimeStopState st = TimeStopState.SERVER;
+                  st.clear();
+                  st.stopped = true;
+                  st.owner = player.getUUID();
+
+                  // Замораживаем смену дня/ночи, погоду и случайные тики блоков (рост растений и т.п.)
+                  GameRules rules = server.getGameRules();
+                  st.prevDaylight = rules.getBoolean(GameRules.RULE_DAYLIGHT);
+                  st.prevWeather = rules.getBoolean(GameRules.RULE_WEATHER_CYCLE);
+                  st.prevRandomTick = rules.getInt(GameRules.RULE_RANDOMTICKING);
+                  rules.getRule(GameRules.RULE_DAYLIGHT).set(false, server);
+                  rules.getRule(GameRules.RULE_WEATHER_CYCLE).set(false, server);
+                  rules.getRule(GameRules.RULE_RANDOMTICKING).set(0, server);
+
+                  for (ServerLevel level : server.getAllLevels()) {
+                      List<Entity> list = new ArrayList<>();
+                      level.getAllEntities().forEach(list::add);
+                      TimeStopHold.hold(list, st);
+                  }
+
+                  playForAll(server, SoundEvents.BELL_RESONATE, 2.0F, 0.5F);
+                  playForAll(server, SoundEvents.WARDEN_HEARTBEAT, 2.0F, 0.6F);
+                  player.displayClientMessage(Component.translatable("message.timestopclock.stopped"), true);
+                  ModNetwork.sendToAll(new SyncPacket(true, st.owner));
+              }
+
+              public static void resume(MinecraftServer server) {
+                  TimeStopState st = TimeStopState.SERVER;
+                  if (!st.stopped) return;
+                  st.stopped = false;
+
+                  // Возвращаем скорости замороженным сущностям
+                  for (Map.Entry<UUID, Vec3> en : st.vel.entrySet()) {
+                      Entity e = find(server, en.getKey());
+                      if (e != null && !(e instanceof Player)) {
+                          e.setDeltaMovement(en.getValue());
+                          e.hurtMarked = true;
+                      }
+                  }
+
+                  // Возвращаем игровые правила
+                  GameRules rules = server.getGameRules();
+                  rules.getRule(GameRules.RULE_DAYLIGHT).set(st.prevDaylight, server);
+                  rules.getRule(GameRules.RULE_WEATHER_CYCLE).set(st.prevWeather, server);
+                  rules.getRule(GameRules.RULE_RANDOMTICKING).set(st.prevRandomTick, server);
+
+                  UUID ownerId = st.owner;
+                  List<Map.Entry<UUID, TimeStopState.Pending>> pending = new ArrayList<>(st.pending.entrySet());
+                  st.clear();
+                  st.owner = null;
+
+                  // Все накопленные удары достигают цели одновременно
+                  for (Map.Entry<UUID, TimeStopState.Pending> en : pending) {
+                      Entity e = find(server, en.getKey());
+                      if (e instanceof LivingEntity living && living.isAlive()) {
+                          living.invulnerableTime = 0;
+                          living.hurt(en.getValue().source, en.getValue().amount);
+                      }
+                  }
+
+                  playForAll(server, SoundEvents.BEACON_POWER_SELECT, 2.0F, 0.8F);
+                  ServerPlayer owner = ownerId == null ? null : server.getPlayerList().getPlayer(ownerId);
+                  if (owner != null) {
+                      owner.displayClientMessage(Component.translatable("message.timestopclock.resumed"), true);
+                  }
+                  ModNetwork.sendToAll(new SyncPacket(false, null));
+              }
+
+              private static Entity find(MinecraftServer server, UUID id) {
+                  for (ServerLevel level : server.getAllLevels()) {
+                      Entity e = level.getEntity(id);
+                      if (e != null) return e;
+                  }
+                  return null;
+              }
+
+              private static void playForAll(MinecraftServer server, SoundEvent sound, float volume, float pitch) {
+                  for (ServerPlayer p : server.getPlayerList().getPlayers()) {
+                      p.playNotifySound(sound, SoundSource.PLAYERS, volume, pitch);
+                  }
+              }
+
+              private TimeStopManager() {}
+          }
+          MODEOF
+          mkdir -p "modsrc/src/main/java/com/example/timestopclock/time"
+          cat > "modsrc/src/main/java/com/example/timestopclock/time/TimeStopState.java" <<'MODEOF'
+          package com.example.timestopclock.time;
+
+          import net.minecraft.world.damagesource.DamageSource;
+          import net.minecraft.world.entity.Entity;
+          import net.minecraft.world.level.Level;
+          import net.minecraft.world.phys.Vec3;
+
+          import java.util.HashMap;
+          import java.util.Map;
+          import java.util.UUID;
+
+          /**
+           * Состояние остановки времени. Отдельные экземпляры для сервера и клиента,
+           * чтобы в одиночной игре (встроенный сервер) они не мешали друг другу.
+           */
+          public final class TimeStopState {
+              public static final TimeStopState SERVER = new TimeStopState();
+              public static final TimeStopState CLIENT = new TimeStopState();
+
+              public boolean stopped;
+              public UUID owner;
+
+              /** Позиции и скорости замороженных сущностей. */
+              public final Map<UUID, Vec3> pos = new HashMap<>();
+              public final Map<UUID, Vec3> vel = new HashMap<>();
+              public final Map<UUID, Integer> fuse = new HashMap<>();
+              /** Урон, накопленный за время остановки (применится при возобновлении). */
+              public final Map<UUID, Pending> pending = new HashMap<>();
+
+              public boolean prevDaylight;
+              public boolean prevWeather;
+              public int prevRandomTick;
+
+              public static TimeStopState of(Level level) {
+                  return level.isClientSide() ? CLIENT : SERVER;
+              }
+
+              public boolean isFrozen(Entity e) {
+                  if (!stopped) return false;
+                  if (owner != null) {
+                      if (e.getUUID().equals(owner)) return false;
+                      // Транспорт, на котором едет владелец, не замораживаем
+                      for (Entity passenger : e.getPassengers()) {
+                          if (passenger.getUUID().equals(owner)) return false;
+                      }
+                  }
+                  return true;
+              }
+
+              public void clear() {
+                  pos.clear();
+                  vel.clear();
+                  fuse.clear();
+                  pending.clear();
+              }
+
+              public static final class Pending {
+                  public final DamageSource source;
+                  public float amount;
+
+                  public Pending(DamageSource source) {
+                      this.source = source;
+                  }
+              }
+          }
+          MODEOF
+          mkdir -p "modsrc/src/main/resources/META-INF"
+          cat > "modsrc/src/main/resources/META-INF/mods.toml" <<'MODEOF'
+          modLoader="javafml"
+          loaderVersion="[47,)"
+          license="MIT"
+
+          [[mods]]
+          modId="timestopclock"
+          version="1.0.0"
+          displayName="Time Stop Clock"
+          description='''Часы, которые останавливают время, как The World из JoJo. ПКМ - остановить, ещё раз ПКМ - возобновить.'''
+
+          [[dependencies.timestopclock]]
+          modId="forge"
+          mandatory=true
+          versionRange="[47,)"
+          ordering="NONE"
+          side="BOTH"
+
+          [[dependencies.timestopclock]]
+          modId="minecraft"
+          mandatory=true
+          versionRange="[1.20.1,1.21)"
+          ordering="NONE"
+          side="BOTH"
+          MODEOF
+          mkdir -p "modsrc/src/main/resources/assets/timestopclock/lang"
+          cat > "modsrc/src/main/resources/assets/timestopclock/lang/en_us.json" <<'MODEOF'
+          {
+            "item.timestopclock.time_stop_clock": "Time Stop Clock",
+            "itemGroup.timestopclock": "Time Stop Clock",
+            "tooltip.timestopclock.time_stop_clock": "Right-click to stop time. Right-click again to resume.",
+            "message.timestopclock.stopped": "Time has stopped",
+            "message.timestopclock.resumed": "Time flows again",
+            "message.timestopclock.busy": "Time is already stopped by another player",
+            "title.timestopclock.za_warudo": "ZA WARUDO!",
+            "subtitle.timestopclock.stopped": "Time has stopped"
+          }
+          MODEOF
+          mkdir -p "modsrc/src/main/resources/assets/timestopclock/lang"
+          cat > "modsrc/src/main/resources/assets/timestopclock/lang/ru_ru.json" <<'MODEOF'
+          {
+            "item.timestopclock.time_stop_clock": "Часы остановки времени",
+            "itemGroup.timestopclock": "Time Stop Clock",
+            "tooltip.timestopclock.time_stop_clock": "ПКМ - остановить время. Ещё раз ПКМ - возобновить.",
+            "message.timestopclock.stopped": "Время остановлено",
+            "message.timestopclock.resumed": "Время возобновило ход",
+            "message.timestopclock.busy": "Время уже остановлено другим игроком",
+            "title.timestopclock.za_warudo": "ЗА ВАРУДО!",
+            "subtitle.timestopclock.stopped": "Время остановлено"
+          }
+          MODEOF
+          mkdir -p "modsrc/src/main/resources/assets/timestopclock/models/item"
+          cat > "modsrc/src/main/resources/assets/timestopclock/models/item/time_stop_clock.json" <<'MODEOF'
+          {
+            "parent": "item/generated",
+            "textures": {
+              "layer0": "timestopclock:item/time_stop_clock"
+            }
+          }
+          MODEOF
+          mkdir -p "modsrc/src/main/resources/assets/timestopclock/textures/item"
+          base64 -d > "modsrc/src/main/resources/assets/timestopclock/textures/item/time_stop_clock.png" <<'B64EOF'
+          iVBORw0KGgoAAAANSUhEUgAAABMAAAATCAYAAAByUDbMAAACiklEQVR4nI2Uz29NURDHP3POvVd/aJuKIBGSUkKr1dggUiRigYSw6aKIVRckFf4FW5qIWEtattKyYIFKkDR2grYIkYhfEbR9lfa9e+4Zi3vfa19/8U0mOXfmzPfMfGdyhTmYenJI+29/AMzcUBkSK5y8PCyzfaWPqWeH9VbfS56/rSMxDqPFiGJU+Dk2Tn19HZAGcpPjHNm1HLUBp3tGpUSWGzymA7ff8/CV4/z1B4DBqAcMQkxLcwOvRr7gvcsq9tgopKernX1tDjEhp668EQMwMDDMoxeOG49HsaJYBBGLiIBEvBz+jKqWfCIWKRToe/qOe0NQYdNqJTd4UC9e+kr3tftgFPUhXlyZPtXV1eTzeZxL/cYYJPG4QLCx4+rZw+xtE4I7/R/xxiCEeK+IJLRuXctsZUWEJEkwJh2KqjI88oMgVpx41BTwVggAjFqiwLCxcUXaBn7JaYoITU2rAHjx+hseg6imZHE8TePmlYDPZiKLEs1dg23Na0DSvAAgCJZlwaV3a1FSNYCm2VEUIWLntWKtxVo7nyGDqhKYEFWdKWVycgLnCvMuxnFMHMckScKn2grGKa6sLz3ofJyuUJEsDMMFKzDGlKzm1xjTqxsRHMksOVziS+fg36qkqI+q0O8jQMBijf+34oJHCZe8Y6LaKnK5P7O08ItdLatoeiohASJjmJoYo9JmD/V2b9KuAy0qgnpdGN6XR1yiKibQzj2tevNCm5balMDTvj3PmfYtACRzLKyswosQKyVTVTp2NrBj/W86OzdkUmTo627S6gqhf8hjKOAzOQ3FFfDYbAU8oBQ4uqueE8fXYXfflTKyInrPNWsc5GeEz36SKjNnj9JxYj01+wfL8v8CZUUmztcKGOQAAAAASUVORK5CYII=
+          B64EOF
+          mkdir -p "modsrc/src/main/resources/data/timestopclock/recipes"
+          cat > "modsrc/src/main/resources/data/timestopclock/recipes/time_stop_clock.json" <<'MODEOF'
+          {
+            "type": "minecraft:crafting_shaped",
+            "category": "misc",
+            "pattern": ["GEG", "ECE", "GNG"],
+            "key": {
+              "G": { "item": "minecraft:gold_ingot" },
+              "E": { "item": "minecraft:ender_pearl" },
+              "C": { "item": "minecraft:clock" },
+              "N": { "item": "minecraft:nether_star" }
+            },
+            "result": { "item": "timestopclock:time_stop_clock" }
+          }
+          MODEOF
+          mkdir -p "modsrc/src/main/resources"
+          cat > "modsrc/src/main/resources/pack.mcmeta" <<'MODEOF'
+          {
+            "pack": {
+              "description": "Time Stop Clock resources",
+              "pack_format": 15
+            }
+          }
+          MODEOF
+
+          echo "Created files:"
+          find modsrc -type f
+
+      - name: Download Forge MDK
+        run: |
+          curl -fsSL -o /tmp/mdk.zip "https://maven.minecraftforge.net/net/minecraftforge/forge/${FORGE_VERSION}/forge-${FORGE_VERSION}-mdk.zip"
+          mkdir -p /tmp/mdk
+          unzip -q /tmp/mdk.zip -d /tmp/mdk
+          MDK_DIR=$(dirname "$(find /tmp/mdk -name gradlew | head -1)")
+          echo "MDK_DIR=$MDK_DIR" >> "$GITHUB_ENV"
+          ls "$MDK_DIR"
+
+      - name: Insert mod sources into MDK
+        run: |
+          rm -rf "$MDK_DIR/src"
+          cp -r modsrc/src "$MDK_DIR/src"
+          sed -i "s/^mod_id=.*/mod_id=${MOD_ID}/" "$MDK_DIR/gradle.properties"
+          sed -i "s/^mod_name=.*/mod_name=Time Stop Clock/" "$MDK_DIR/gradle.properties"
+          sed -i "s/^mod_group_id=.*/mod_group_id=com.example.timestopclock/" "$MDK_DIR/gradle.properties"
+          sed -i "s/^mod_version=.*/mod_version=1.0.0/" "$MDK_DIR/gradle.properties"
+          chmod +x "$MDK_DIR/gradlew"
+
+      - name: Build
+        working-directory: ${{ env.MDK_DIR }}
+        run: ./gradlew build --no-daemon
+
+      - name: Upload jar
+        uses: actions/upload-artifact@v4
+        with:
+          name: timestopclock-jar
+          path: ${{ env.MDK_DIR }}/build/libs/*.jar
